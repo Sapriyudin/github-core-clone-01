@@ -125,8 +125,8 @@ export class Repo {
   nextLabelId = 1;
   /** Monotonic commit clock: deterministic shas within a run. */
   private clock = 1_700_000_000;
-  /** Pack cache: key -> pack bytes (bounded, FIFO). */
-  readonly packCache = new Map<string, Buffer>();
+  /** Pack cache: key -> { pack bytes, shallow boundaries } (bounded, FIFO). */
+  readonly packCache = new Map<string, { pack: Buffer; shallow: string[] }>();
 
   constructor(id: number, owner: string, name: string, description: string, privateFlag: boolean) {
     this.id = id;
@@ -148,6 +148,17 @@ export class Repo {
     const oid = hashObject(type, data);
     if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
     return oid;
+  }
+
+  /**
+   * Insert objects already keyed by oid (e.g. from readPack), skipping ones
+   * already present. Skips the second hash storeObject would do per object:
+   * the map's keys already are the oids.
+   */
+  storeObjects(objects: Map<string, GitObject>): void {
+    for (const [oid, obj] of objects) {
+      if (!this.objects.has(oid)) this.objects.set(oid, obj);
+    }
   }
 
   getObject(oid: string): GitObject | undefined {
