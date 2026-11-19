@@ -12,10 +12,11 @@ export function isOid(value: unknown): value is string {
   return typeof value === 'string' && /^[0-9a-f]{40}$/.test(value);
 }
 
-/** The git object id of `<type> <len>\0<data>`. */
+/** The git object id of `<type> <len>\0<data>`. Hashes the header and the data
+ * as two updates, so no concatenated copy of the data is ever allocated. */
 export function hashObject(type: string, data: Buffer): string {
   const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1(Buffer.concat([header, data]));
+  return createHash('sha1').update(header).update(data).digest('hex');
 }
 
 /** Standard base64 of bytes or UTF-8 text. */
