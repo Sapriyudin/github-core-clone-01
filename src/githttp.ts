@@ -5,7 +5,7 @@
 // per (wants, haves, depth) for the clone workload.
 import {
   collectReachable,
-  commitAncestors,
+  isAncestor,
   parseCommit,
   parseTag,
   parseTree,
@@ -207,23 +207,24 @@ function exclusionSet(repo: Repo, roots: readonly string[], cutoffs: ReadonlySet
   return seen;
 }
 
-/** Build (or reuse from cache) the pack for a fetch. */
+/** Build (or reuse from cache) the pack for a fetch. The shallow list is
+ * cached with the pack: it is deterministic for the same request, and
+ * recomputing it (fetchObjects) on every cache hit cost a full tree walk
+ * per clone. The key includes the shallow boundaries: they change the
+ * exclusion cutoffs, so they change the pack. */
 function fetchPack(repo: Repo, req: FetchRequest): { pack: Buffer; shallow: string[] } {
-  const key = [...req.wants].sort().join(',') + '|' + [...req.haves].sort().join(',') + '|' + String(req.depth);
+  const key = [...req.wants].sort().join(',') + '|' + [...req.haves].sort().join(',') + '|' + String(req.depth) + '|' + [...req.shallowBoundaries].sort().join(',');
   const cached = repo.packCache.get(key);
-  if (cached) {
-    // The shallow list is deterministic for the same request; recompute cheaply.
-    const { shallow } = fetchObjects(repo, req);
-    return { pack: cached, shallow };
-  }
+  if (cached) return cached;
   const { objects, shallow } = fetchObjects(repo, req);
   const pack = writePack(objects);
   if (repo.packCache.size >= 64) {
     const first = repo.packCache.keys().next().value as string | undefined;
     if (first !== undefined) repo.packCache.delete(first);
   }
-  repo.packCache.set(key, pack);
-  return { pack, shallow };
+  const entry = { pack, shallow };
+  repo.packCache.set(key, entry);
+  return entry;
 }
 
 function v2LsRefs(repo: Repo, args: readonly string[]): Buffer {
@@ -393,7 +394,7 @@ export function receivePack(repo: Repo | undefined, body: Buffer): { status: num
     }
     try {
       const objects = readPack(packBytes);
-      for (const obj of objects.values()) repo.storeObject(obj.type, obj.data);
+      repo.storeObjects(objects);
     } catch (err) {
       return {
         status: 200,
@@ -444,11 +445,11 @@ export function receivePack(repo: Repo | undefined, body: Buffer): { status: num
       results.push({ ref: command.ref, ok: false, reason: 'old oid mismatch' });
       continue;
     }
-    // Fast-forward: the new tip must descend from the old tip.
+    // Fast-forward: the new tip must descend from the old tip. isAncestor
+    // stops at the old tip instead of walking the whole chain.
     let ff = false;
     try {
-      const ancestors = commitAncestors(command.newOid, (oid) => repo.getObject(oid));
-      ff = ancestors.has(current);
+      ff = isAncestor(current, command.newOid, (oid) => repo.getObject(oid));
     } catch {
       ff = false;
     }
