@@ -213,9 +213,8 @@ export function readPack(buf: Buffer): Map<string, GitObject> {
       }
       const base = byOffset.get(entryOffset - baseOffset);
       if (!base) throw new Error('OFS_DELTA base is not an earlier pack entry');
-      const inflated = inflateSync(buf.subarray(offset));
-      const consumed = inflatedConsumed(buf, offset);
-      offset += consumed;
+      const { data: inflated, next } = inflateEntry(buf, offset, end);
+      offset = next;
       const data = applyDelta(base.data, inflated);
       const obj: GitObject = { type: base.type, data };
       objects.set(hashObject(obj.type, obj.data), obj);
@@ -227,9 +226,8 @@ export function readPack(buf: Buffer): Map<string, GitObject> {
       offset += 20;
       const base = objects.get(baseOid);
       if (!base) throw new Error(`REF_DELTA base ${baseOid} is not in the pack`);
-      const inflated = inflateSync(buf.subarray(offset));
-      const consumed = inflatedConsumed(buf, offset);
-      offset += consumed;
+      const { data: inflated, next } = inflateEntry(buf, offset, end);
+      offset = next;
       const data = applyDelta(base.data, inflated);
       const obj: GitObject = { type: base.type, data };
       objects.set(hashObject(obj.type, obj.data), obj);
@@ -237,9 +235,8 @@ export function readPack(buf: Buffer): Map<string, GitObject> {
     } else {
       const type = PACK_TYPES[typeId];
       if (!type) throw new Error(`unknown pack object type ${typeId}`);
-      const inflated = inflateSync(buf.subarray(offset));
-      const consumed = inflatedConsumed(buf, offset);
-      offset += consumed;
+      const { data: inflated, next } = inflateEntry(buf, offset, end);
+      offset = next;
       if (inflated.length !== size) throw new Error(`pack object size ${inflated.length} != declared ${size}`);
       const obj: GitObject = { type, data: inflated };
       objects.set(hashObject(type, inflated), obj);
@@ -249,27 +246,48 @@ export function readPack(buf: Buffer): Map<string, GitObject> {
   return objects;
 }
 
-/**
- * How many compressed bytes the zlib stream at `offset` occupies. inflateSync
- * ignores trailing bytes but throws on a truncated stream, so the shortest
- * prefix that inflates to the full result is exactly the stream's end.
- */
-function inflatedConsumed(buf: Buffer, offset: number): number {
-  const rest = buf.subarray(offset);
-  const inflated = inflateSync(rest);
-  let lo = 1;
-  let hi = rest.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    try {
-      const trial = inflateSync(rest.subarray(0, mid));
-      if (trial.equals(inflated)) hi = mid;
-      else lo = mid + 1;
-    } catch {
-      lo = mid + 1;
-    }
+/** Adler-32 checksum of bytes (the checksum a zlib stream ends with). */
+export function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < data.length; i += 1) {
+    a = (a + (data[i] as number)) % 65521;
+    b = (b + a) % 65521;
   }
-  return lo;
+  return ((b << 16) | a) >>> 0;
+}
+
+/**
+ * Inflate the FIRST zlib stream starting at `offset` in `buf` and return its
+ * bytes plus the offset just past the stream (where the next entry starts).
+ * `end` bounds the search (a pack's trailer sits after it).
+ *
+ * How the end is found, without re-inflating prefixes: a zlib stream ends
+ * with the Adler-32 of its uncompressed bytes, so after one inflate the
+ * stream's end is the first place those 4 bytes appear. A candidate is only
+ * accepted when re-inflating exactly that prefix reproduces the same bytes,
+ * so a coincidental Adler match inside the deflate data is skipped, never
+ * trusted. Two inflates per entry, no throws on the happy path — the old
+ * binary search re-inflated ~log2(n) prefixes per entry and threw (with a
+ * stack trace) on every truncated trial.
+ */
+function inflateEntry(buf: Buffer, offset: number, end: number): { data: Buffer; next: number } {
+  const data = inflateSync(buf.subarray(offset, end));
+  const adler = Buffer.alloc(4);
+  adler.writeUInt32BE(adler32(data), 0);
+  let from = offset + 2;
+  for (;;) {
+    const at = buf.indexOf(adler, from);
+    if (at < 0 || at + 4 > end) throw new Error('pack object has no zlib stream end');
+    const candidateEnd = at + 4;
+    try {
+      const check = inflateSync(buf.subarray(offset, candidateEnd));
+      if (check.equals(data)) return { data, next: candidateEnd };
+    } catch {
+      // A coincidental Adler match inside the deflate data: keep scanning.
+    }
+    from = at + 1;
+  }
 }
 
 /** Write an undeltified pack v2 from objects (each stored once, by oid). */
@@ -354,10 +372,26 @@ export function commitAncestors(tip: string, lookup: ObjectLookup, limit = 100_0
   return seen;
 }
 
-/** Whether `ancestor` is an ancestor of (or equal to) `descendant`. */
+/**
+ * Whether `ancestor` is an ancestor of (or equal to) `descendant`. The walk
+ * stops the moment the ancestor is found, so a fast-forward check on a long
+ * linear history costs one step (the new tip's parent is the old tip),
+ * not a walk of the whole chain.
+ */
 export function isAncestor(ancestor: string, descendant: string, lookup: ObjectLookup): boolean {
   if (ancestor === descendant) return true;
-  return commitAncestors(descendant, lookup).has(ancestor);
+  const seen = new Set<string>();
+  const stack: string[] = [descendant];
+  while (stack.length > 0) {
+    const oid = stack.pop() as string;
+    if (oid === ancestor) return true;
+    if (oid === ZERO_OID || seen.has(oid)) continue;
+    seen.add(oid);
+    const obj = lookup(oid);
+    if (!obj || obj.type !== 'commit') continue;
+    for (const parent of parseCommit(obj.data).parents) stack.push(parent);
+  }
+  return false;
 }
 
 /** The first common ancestor of two commits (merge-base), or null. */
